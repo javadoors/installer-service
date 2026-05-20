@@ -282,12 +282,454 @@ func buildUpgradeScript(patchPath, patchName, bootstrapIp string, online bool) s
 | `DefaultRemotePatchPath` | `https://openfuyao.obs.cn-north-4.myhuaweicloud.com/openFuyao/version-config/` | 在线模式补丁文件远程路径 |
 
 ## 七、注意事项与潜在问题
-
 1. **`AutoUpgradeResponse` 和 `AutoUpgradeStatusResponse` 已定义但未使用**：[types.go:62-71](file:///d:\code\github\installer-service\pkg\installer\types.go#L62-L71) 中定义了包含 `taskID` 的响应结构，但当前 `autoUpgrade` handler 是同步执行的，直接返回成功/失败，未实现异步任务机制。
-
 2. **`PatchYaml(object, isUpgrade)` 方法在升级流程中未被直接调用**：当前的升级流程使用 `UpgradeOpenFuyao()` 直接 Patch BKECluster CR，而 `PatchYaml` 是更通用的 YAML Patch 方法，两者存在功能重叠。
-
 3. **在线/离线模式判断**：通过 ConfigMap 中的 `otherRepo` 和 `onlineImage` 字段判断，在线模式下禁止上传 patch 文件，但会自动从远程仓库拉取。
-
 4. **版本筛选逻辑**：`GetOpenFuyaoUpgradeVersions` 的筛选规则确保了升级路径的合理性——补丁版本只能从同主版本升级，跨 Minor/Major 版本只能升级到非补丁版本。
         
+
+# 📡 `installer-service` RESTful API 规格说明书
+pkg\api\clustermanage中的代码实现，并梳理每个restful的业务规格与功能
+
+> **Base Path**: `/rest/cluster/v1` (REST) | `/ws/cluster/v1` (WebSocket)  
+> **框架**: `go-restful/v3` | **风格**: RESTful + WebSocket
+
+## 一、集群管理 API (`registerClusterRoutes`)
+
+### 1.1 创建集群
+| 规格项 | 说明 |
+| :--- | :--- |
+| **Method** | `POST` |
+| **Path** | `/clusters` |
+| **Handler** | `createCluster` |
+| **功能** | 接收集群配置参数，构建 BKECluster CR YAML 并提交到 K8s 集群 |
+
+**请求示例**:
+```json
+POST /rest/cluster/v1/clusters
+{
+  "cluster": {
+    "name": "prod-cluster-01",
+    "openFuyaoVersion": "v2.5.0",
+    "imageRepo": {
+      "url": "https://registry.example.com",
+      "ip": "192.168.1.100"
+    }
+  },
+  "controlPlaneEndpoint": "192.168.1.10:6443",
+  "addons": [
+    { "name": "calico", "params": { "version": "v3.26" } }
+  ],
+  "nodes": [
+    {
+      "hostname": "master-01",
+      "ip": "192.168.1.11",
+      "port": "22",
+      "username": "root",
+      "password": "***",
+      "role": ["master", "etcd"]
+    }
+  ]
+}
+```
+
+**响应示例**:
+```json
+HTTP/1.1 200 OK
+{
+  "code": 200,
+  "message": "success",
+  "data": null
+}
+```
+
+### 1.2 获取集群列表
+| 规格项 | 说明 |
+| :--- | :--- |
+| **Method** | `GET` |
+| **Path** | `/clusters` |
+| **Handler** | `listClusterGet` |
+| **功能** | 获取所有已创建的集群摘要信息列表 |
+
+**响应示例**:
+```json
+HTTP/1.1 200 OK
+{
+  "code": 200,
+  "message": "success",
+  "data": {
+    "items": [
+      {
+        "name": "prod-cluster-01",
+        "openFuyaoVersion": "v2.5.0",
+        "kubernetesVersion": "v1.28.0",
+        "containerdVersion": "v1.7.0",
+        "status": "Running",
+        "createTime": "2025-05-10T10:00:00Z",
+        "nodeSum": 5,
+        "isAmd": true,
+        "isArm": false,
+        "addons": ["calico", "coredns"],
+        "osList": ["Ubuntu 22.04"],
+        "containerRuntime": "containerd"
+      }
+    ]
+  }
+}
+```
+
+### 1.3 获取集群详情（含节点）
+| 规格项 | 说明 |
+| :--- | :--- |
+| **Method** | `GET` |
+| **Path** | `/clusters/{cluster-name}` |
+| **Handler** | `getClusterFull` |
+| **功能** | 获取指定集群的详细配置及关联的节点列表 |
+
+**响应示例**:
+```json
+HTTP/1.1 200 OK
+{
+  "code": 200,
+  "message": "success",
+  "data": {
+    "clusterName": "prod-cluster-01",
+    "clusterStatus": "Running",
+    "openFuyaoVersion": "v2.5.0",
+    "createTime": "2025-05-10T10:00:00Z",
+    "isHA": true,
+    "imageRepo": { "url": "...", "ip": "..." },
+    "httpRepo": { "url": "...", "ip": "..." },
+    "nodes": [
+      {
+        "hostname": "master-01",
+        "ip": "192.168.1.11",
+        "role": ["master", "etcd"],
+        "cpu": 8,
+        "memory": 32.0,
+        "architecture": "amd64",
+        "status": "Ready",
+        "os": "Ubuntu 22.04"
+      }
+    ]
+  }
+}
+```
+
+### 1.4 删除集群
+| 规格项 | 说明 |
+| :--- | :--- |
+| **Method** | `DELETE` |
+| **Path** | `/clusters/{cluster-name}` |
+| **Handler** | `deleteCluster` |
+| **功能** | 触发集群删除流程（设置 DeletionTimestamp，由 Controller 执行清理） |
+
+**响应示例**:
+```json
+HTTP/1.1 200 OK
+{
+  "code": 200,
+  "message": "success",
+  "data": null
+}
+```
+
+## 二、节点管理 API (`registerNodeRoutes`)
+
+### 2.1 节点校验
+| 规格项 | 说明 |
+| :--- | :--- |
+| **Method** | `POST` |
+| **Path** | `/nodes/validate` |
+| **Handler** | `judgeClusterNode` |
+| **功能** | 校验节点信息是否符合集群部署要求（网络连通性、资源规格等） |
+
+**请求示例**:
+```json
+POST /rest/cluster/v1/nodes/validate
+{
+  "nameSpace": "prod-cluster-01",
+  "nodes": [
+    {
+      "hostname": "worker-01",
+      "ip": "192.168.1.21",
+      "port": "22",
+      "username": "root",
+      "password": "***",
+      "role": ["worker"]
+    }
+  ],
+  "balanceIp": "192.168.1.10"
+}
+```
+
+**响应示例 (成功)**:
+```json
+HTTP/1.1 200 OK
+{ "code": 200, "message": "success", "data": null }
+```
+
+**响应示例 (失败)**:
+```json
+HTTP/1.1 400 Bad Request
+{
+  "code": 400,
+  "message": "node 192.168.1.21 ssh connection failed: timeout",
+  "data": null
+}
+```
+
+### 2.2 获取节点列表
+| 规格项 | 说明 |
+| :--- | :--- |
+| **Method** | `GET` |
+| **Path** | `/clusters/{cluster-name}/nodes` |
+| **Handler** | `listNode` |
+| **Query** | `nodeName` (可选，过滤指定节点) |
+| **功能** | 获取集群内所有节点或指定节点的详细信息 |
+
+**响应示例**:
+```json
+HTTP/1.1 200 OK
+{
+  "code": 200,
+  "message": "success",
+  "data": {
+    "items": [
+      {
+        "hostname": "worker-01",
+        "ip": "192.168.1.21",
+        "role": ["worker"],
+        "cpu": 16,
+        "memory": 64.0,
+        "architecture": "arm64",
+        "status": "Ready",
+        "os": "Kylin V10"
+      }
+    ]
+  }
+}
+```
+
+### 2.3 集群扩容
+| 规格项 | 说明 |
+| :--- | :--- |
+| **Method** | `POST` |
+| **Path** | `/clusters/{cluster-name}/scale-up` |
+| **Handler** | `scaleUpCluster` |
+| **功能** | 向集群添加新节点（创建 BKENode CR） |
+
+**请求示例**:
+```json
+POST /rest/cluster/v1/clusters/prod-cluster-01/scale-up
+{
+  "nodes": [
+    {
+      "hostname": "worker-02",
+      "ip": "192.168.1.22",
+      "port": "22",
+      "username": "root",
+      "password": "***",
+      "role": ["worker"]
+    }
+  ]
+}
+```
+
+**响应示例**:
+```json
+HTTP/1.1 200 OK
+{ "code": 200, "message": "success", "data": null }
+```
+
+### 2.4 集群缩容
+| 规格项 | 说明 |
+| :--- | :--- |
+| **Method** | `POST` |
+| **Path** | `/clusters/{cluster-name}/scale-down` |
+| **Handler** | `scaleDownCluster` |
+| **功能** | 从集群移除指定节点（删除 BKENode CR） |
+
+**请求示例**:
+```json
+POST /rest/cluster/v1/clusters/prod-cluster-01/scale-down
+{
+  "nodes": ["worker-01", "worker-02"]
+}
+```
+
+**响应示例**:
+```json
+HTTP/1.1 200 OK
+{ "code": 200, "message": "success", "data": null }
+```
+
+## 三、升级管理 API (`registerUpgradeRoutes`)
+
+### 3.1 升级集群
+| 规格项 | 说明 |
+| :--- | :--- |
+| **Method** | `POST` |
+| **Path** | `/clusters/{cluster-name}/upgrade` |
+| **Handler** | `upgradeCluster` |
+| **功能** | 触发集群升级，Patch BKECluster CR 的 `openFuyaoVersion` 字段 |
+
+**请求示例**:
+```json
+POST /rest/cluster/v1/clusters/prod-cluster-01/upgrade
+{
+  "version": "v2.6.0"
+}
+```
+
+**响应示例**:
+```json
+HTTP/1.1 200 OK
+{ "code": 200, "message": "success", "data": null }
+```
+
+### 3.2 上传补丁文件
+| 规格项 | 说明 |
+| :--- | :--- |
+| **Method** | `POST` |
+| **Path** | `/patches` |
+| **Handler** | `uploadPatchFile` |
+| **功能** | 上传离线升级补丁 YAML 文件，存储到 ConfigMap |
+
+**请求示例**:
+```json
+POST /rest/cluster/v1/patches
+{
+  "PatchFileName": "patch-v2.5.0-to-v2.6.0.yaml",
+  "PatchFileContent": "openFuyaoVersion: v2.6.0\nkubernetesVersion: v1.29.0\netcdVersion: v3.5.12\n..."
+}
+```
+
+**响应示例**:
+```json
+HTTP/1.1 200 OK
+{ "code": 200, "message": "success", "data": null }
+```
+
+### 3.3 获取可用版本列表
+| 规格项 | 说明 |
+| :--- | :--- |
+| **Method** | `GET` |
+| **Path** | `/versions` |
+| **Handler** | `getOpenFuyaoVersions` |
+| **功能** | 获取所有可安装的 openFuyao 版本（过滤 Patch 版本） |
+
+**响应示例**:
+```json
+HTTP/1.1 200 OK
+{
+  "code": 200,
+  "message": "success",
+  "data": {
+    "versions": ["v2.4.0", "v2.5.0", "v2.6.0", "latest"]
+  }
+}
+```
+
+### 3.4 获取可升级版本
+| 规格项 | 说明 |
+| :--- | :--- |
+| **Method** | `GET` |
+| **Path** | `/clusters/{cluster-name}/upgrade-versions` |
+| **Handler** | `getUpgradeOpenFuyaoVersions` |
+| **Query** | `currentVersion` (可选) |
+| **功能** | 根据当前版本计算合法的可升级目标版本列表 |
+
+**响应示例**:
+```json
+HTTP/1.1 200 OK
+{
+  "code": 200,
+  "message": "success",
+  "data": {
+    "versions": ["v2.6.0", "v2.7.0"]
+  }
+}
+```
+
+### 3.5 自动升级准备
+| 规格项 | 说明 |
+| :--- | :--- |
+| **Method** | `POST` |
+| **Path** | `/clusters/{cluster-name}/auto-upgrade` |
+| **Handler** | `autoUpgrade` |
+| **功能** | 同步执行升级前准备脚本（离线包解压、镜像导入、二进制替换） |
+
+**请求示例**:
+```json
+POST /rest/cluster/v1/clusters/prod-cluster-01/auto-upgrade
+{
+  "patchDir": "/opt/patches",
+  "patchName": "patch-v2.5.0-to-v2.6.0"
+}
+```
+
+**响应示例**:
+```json
+HTTP/1.1 200 OK
+{ "code": 200, "message": "success", "data": null }
+```
+
+**响应示例 (失败)**:
+```json
+HTTP/1.1 500 Internal Server Error
+{
+  "code": 500,
+  "message": "Auto upgrade preparation failed: patch directory not found",
+  "data": null
+}
+```
+
+## 四、配置管理 API (`registerConfigRoutes`)
+
+### 4.1 获取默认配置
+| 规格项 | 说明 |
+| :--- | :--- |
+| **Method** | `GET` |
+| **Path** | `/configs` |
+| **Handler** | `getDefaultConfig` |
+| **功能** | 获取离线安装所需的默认配置（镜像仓库、HTTP 仓库、IP 等） |
+
+**响应示例**:
+```json
+HTTP/1.1 200 OK
+{
+  "code": 200,
+  "message": "success",
+  "data": {
+    "imageRepo": { "url": "https://registry.example.com", "ip": "192.168.1.100" },
+    "httpRepo": { "url": "https://packages.example.com", "ip": "192.168.1.101" },
+    "ip": "192.168.1.10",
+    "kubernetesVersion": "v1.28.0",
+    "containerRuntime": "containerd",
+    "agentHealthPort": "3377"
+  }
+}
+```
+
+## 五、WebSocket API
+
+### 5.1 实时集群日志
+| 规格项 | 说明 |
+| :--- | :--- |
+| **Protocol** | `WebSocket` |
+| **Path** | `/ws/cluster/v1/clusters/{cluster-name}/logs` |
+| **Handler** | `getClusterLog` |
+| **功能** | 建立 WebSocket 连接，实时推送集群部署/升级事件日志 |
+
+**连接示例**:
+```
+ws://installer-service:8080/ws/cluster/v1/clusters/prod-cluster-01/logs
+```
+
+**推送消息格式**:
+```
+Time:2025-05-10 10:05:00, Type: Normal, Reason: PhaseStarted, Message: EnsureMasterInit started 
+Time:2025-05-10 10:06:30, Type: Normal, Reason: PhaseCompleted, Message: EnsureMasterInit completed 
+Time:2025-05-10 10:10:00, Type: Warning, Reason: PhaseRetry, Message: EnsureWorkerJoin retrying... 
+```
